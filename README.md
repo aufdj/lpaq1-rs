@@ -1,5 +1,5 @@
 # lpaq1-rs
-lpaq1-rs is a Rust port of the [lpaq1 compressor by Matt Mahoney](http://mattmahoney.net/dc/#lpaq).<br>
+lpaq1-rs is a context mixing arithmetic encoder based on the [lpaq1 compressor by Matt Mahoney](http://mattmahoney.net/dc/#lpaq).<br>
 
 
 To compress:<br>

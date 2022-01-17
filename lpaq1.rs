@@ -1,4 +1,5 @@
 use std::{
+    iter::repeat,
     io::{Read, Write, BufReader, BufWriter, BufRead, Seek},
     fs::{File, metadata},
     path::Path,
@@ -128,10 +129,14 @@ impl BufferedWrite for BufWriter<File> {
     }
 }
 fn new_input_file(capacity: usize, file_name: &str) -> BufReader<File> {
-    BufReader::with_capacity(capacity, File::open(file_name).unwrap())
+    BufReader::with_capacity(
+        capacity, File::open(file_name).unwrap()
+    )
 }
 fn new_output_file(capacity: usize, file_name: &str) -> BufWriter<File> {
-    BufWriter::with_capacity(capacity, File::create(file_name).unwrap())
+    BufWriter::with_capacity(
+        capacity, File::create(file_name).unwrap()
+    )
 }
 // ----------------------------------------------------------------------------------------------------------------------------------------
 
@@ -178,30 +183,23 @@ impl Stretch {
 // Adaptive Probability Map -------------------------------------------------------------------------------------- Adaptive Probability Map
 struct Apm {
     s:         Stretch,
-    bin:       usize,    
-    num_cxts:  usize, 
-    bin_map:   Vec<u16>, 
+    bin:       usize,
+    num_cxts:  usize,
+    bin_map:   Vec<u16>,
 }
 impl Apm {
     fn new(n: usize) -> Apm {
-        let mut apm = Apm {  
-            s:         Stretch::new(), 
-            bin:       0, 
+        Apm {
+            s:         Stretch::new(),
+            bin:       0,
             num_cxts:  n,
-            bin_map:   vec![0; n * 33],
-        };
-        for cxt in 0..apm.num_cxts {
-            for bin in 0usize..33 {
-                apm.bin_map[(cxt*33)+bin] = 
-                if cxt == 0 {
-                    (squash(((bin as i32) - 16) * 128) * 16) as u16
-                } 
-                else {
-                    apm.bin_map[bin]
-                }
-            }
+            bin_map:   repeat(
+                       (0..33).map(|i| (squash((i - 16) * 128) * 16) as u16)
+                       .collect::<Vec<u16>>().into_iter() )
+                       .take(n)
+                       .flatten()
+                       .collect::<Vec<u16>>(),
         }
-        apm
     }
     fn p(&mut self, bit: i32, rate: i32, mut pr: i32, cxt: u32) -> i32 {
         assert!(bit == 0 || bit == 1 && pr >= 0 && pr < 4096);
@@ -271,36 +269,30 @@ const STATE_TABLE: [[u8; 2]; 256] = [
 [249,135],[250, 69],[ 80,251],[140,252],[249,135],[250, 69],[ 80,251], // 245
 [140,252],[  0,  0],[  0,  0],[  0,  0]];  // 252
 
-fn next_state(state: u8, bit: i32) -> u8 {
-    STATE_TABLE[state as usize][bit as usize]
-}
 
 #[allow(overflowing_literals)]
-const HI_22_MSK: i32 = 0xFFFFFC00; // High 22 bit mask
+const PR_MSK: i32 = 0xFFFFFC00; // High 22 bit mask
 const LIMIT: usize = 127; // Controls rate of adaptation (higher = slower) (0..1024)
 
+#[derive(Clone)]
 struct StateMap {
     cxt:      usize,       // Context of last prediction
-    cxt_map:  Vec<u32>,    // Maps a context to a prediction and a count 
-    rec_t:    [i32; 1024], // Reciprocal table: controls the size of each adjustment to cxt_map
+    cxt_map:  Vec<u32>,    // Maps a context to a prediction and a count
+    rec_t:    Vec<u16>,    // Reciprocal table: controls the size of each adjustment to cxt_map
 }
 impl StateMap {
     fn new(n: usize) -> StateMap {
-        let mut sm = StateMap { 
+        StateMap {
             cxt:      0,
             cxt_map:  vec![1 << 31; n],
-            rec_t:    [0; 1024],
-        };
-        for i in 0..1024 { 
-            sm.rec_t[i] = (16_384 / (i + i + 3)) as i32; 
+            rec_t:    (0..1024).map(|i| 16_384/(i+i+3)).collect(),
         }
-        sm
     }
     fn p(&mut self, bit: i32, cxt: i32) -> i32 {
         assert!(bit == 0 || bit == 1);
-        self.update(bit);                      
+        self.update(bit);
         self.cxt = cxt as usize;
-        (self.cxt_map[self.cxt] >> 20) as i32  
+        (self.cxt_map[self.cxt] >> 20) as i32
     }
     fn update(&mut self, bit: i32) {
         let count = (self.cxt_map[self.cxt] & 1023) as usize; // Low 10 bits
@@ -309,8 +301,10 @@ impl StateMap {
         if count < LIMIT { self.cxt_map[self.cxt] += 1; }
 
         // Update cxt_map based on prediction error
-        self.cxt_map[self.cxt] = self.cxt_map[self.cxt].wrapping_add(
-        ((((bit << 22) - pr) >> 3) * self.rec_t[count] & HI_22_MSK) as u32); 
+        let pr_err = ((bit << 22) - pr) >> 3; // Prediction error
+        let rec_v = self.rec_t[count] as i32; // Reciprocal value
+        self.cxt_map[self.cxt] = 
+        self.cxt_map[self.cxt].wrapping_add((pr_err * rec_v & PR_MSK) as u32);
     }
 }
 // ----------------------------------------------------------------------------------------------------------------------------------------
@@ -331,7 +325,7 @@ struct Mixer {
     max_in:   usize,
     inputs:   Vec<i32>,
     weights:  Vec<i32>,
-    cxt:      usize,
+    wht_set:  usize,
     pr:       i32,
 }
 impl Mixer {
@@ -340,7 +334,7 @@ impl Mixer {
             max_in:   n,
             inputs:   Vec::with_capacity(n),
             weights:  vec![0; n * m],
-            cxt:      0,
+            wht_set:  0,
             pr:       2048,
         }
     }
@@ -349,17 +343,17 @@ impl Mixer {
         self.inputs.push(pr);
     }
     fn set(&mut self, cxt: u32) {
-        self.cxt = cxt as usize;
+        self.wht_set = (cxt as usize) * self.max_in;
     }
     fn p(&mut self) -> i32 {
-        let d = dot_product(&self.inputs[..], &self.weights[self.cxt*self.max_in..]);
+        let d = dot_product(&self.inputs[..], &self.weights[self.wht_set..]);
         self.pr = squash(d >> 8);
         self.pr
     }
     fn update(&mut self, bit: i32) {
         let error: i32 = ((bit << 12) - self.pr) * 7;
         assert!(error >= -32768 && error < 32768);
-        train(&self.inputs[..], &mut self.weights[self.cxt*self.max_in..], error);
+        train(&self.inputs[..], &mut self.weights[self.wht_set..], error);
         self.inputs.clear();
     }
 }
@@ -374,8 +368,8 @@ const MAX_LEN: usize = 62;
 struct MatchModel {
     mch_ptr:  usize,    hash_s:   usize,
     mch_len:  usize,    hash_l:   usize,
-    cxt:      usize,    buf_pos:  usize,  
-    bits:     usize,    s:        Stretch,                 
+    cxt:      usize,    buf_pos:  usize,
+    bits:     usize,    s:        Stretch,
     sm:       StateMap,
     buf:      Vec<u8>,
     ht:       Vec<u32>,
@@ -385,28 +379,59 @@ impl MatchModel {
         MatchModel {
             mch_ptr:  0,    hash_s:   0,
             mch_len:  0,    hash_l:   0,
-            cxt:      1,    buf_pos:  0,     
+            cxt:      1,    buf_pos:  0,
             bits:     0,    s:        Stretch::new(),
-            sm:       StateMap::new(56 << 8),     
+            sm:       StateMap::new(56 << 8),
             buf:      vec![0; BUF_END + 1],
             ht:       vec![0;  HT_END + 1],
         }
     }
     fn find_or_extend_match(&mut self, hash: usize) {
-        self.mch_ptr = self.ht[hash] as usize; 
-        if self.mch_ptr != self.buf_pos {               
+        self.mch_ptr = self.ht[hash] as usize;
+        if self.mch_ptr != self.buf_pos {
             let mut i = self.mch_ptr - self.mch_len - 1 & BUF_END;
 
-            while i != self.buf_pos  
-            && self.mch_len < MAX_LEN  
-            && self.buf[i] == self.buf[self.buf_pos-self.mch_len-1 & BUF_END] 
+            while i != self.buf_pos
+            && self.mch_len < MAX_LEN
+            && self.buf[i] == self.buf[self.buf_pos-self.mch_len-1 & BUF_END]
             {
                 self.mch_len += 1;
                 i = self.mch_ptr - self.mch_len - 1 & BUF_END;
             }
         }
     }
-    fn p(&mut self, bit: i32, mxr: &mut Mixer) -> usize { 
+    fn len(&self) -> usize {
+        self.mch_len
+    }
+    fn p(&mut self, bit: i32, mxr: &mut Mixer) {
+        self.update(bit);
+
+        let mut cxt = self.cxt;
+
+        let a = (self.buf[self.mch_ptr] as usize) + 256 >> (8 - self.bits);
+        if self.mch_len > 0 && a == cxt {
+            let b = (self.buf[self.mch_ptr] >> 7 - self.bits & 1) as usize;
+            if self.mch_len < 16 {
+                cxt = self.mch_len * 2 + b;
+            }
+            else {
+                cxt = (self.mch_len >> 2) * 2 + b + 24;
+            }
+            cxt = cxt * 256 + self.buf[self.buf_pos-1 & BUF_END] as usize;
+        } 
+        else {
+            self.mch_len = 0;
+        }
+
+        let pr = self.s.stretch(self.sm.p(bit, cxt as i32));
+        mxr.add(pr);
+
+        if self.bits == 0 {
+            self.ht[self.hash_s] = self.buf_pos as u32;
+            self.ht[self.hash_l] = self.buf_pos as u32;
+        }
+    }
+    fn update(&mut self, bit: i32) {
         self.cxt += self.cxt + bit as usize;
         self.bits += 1;
         if self.bits == 8 {
@@ -422,7 +447,7 @@ impl MatchModel {
                 self.mch_ptr += 1;
                 self.mch_ptr &= BUF_END;
                 if self.mch_len < MAX_LEN { self.mch_len += 1; }
-            } 
+            }
             else {
                 self.find_or_extend_match(self.hash_s);
             }
@@ -432,36 +457,8 @@ impl MatchModel {
                 self.find_or_extend_match(self.hash_l);
             }
         }
-
-        // Predict -----
-        let mut cxt = self.cxt;
-        if self.mch_len > 0 
-        && (self.buf[self.mch_ptr] as usize) + 256 >> 8 - self.bits == cxt {
-            let b = (self.buf[self.mch_ptr] >> 7 - self.bits & 1) as usize;
-            if self.mch_len < 16 { 
-                cxt = self.mch_len * 2 + b; 
-            } 
-            else { 
-                cxt = (self.mch_len >> 2) * 2 + b + 24; 
-            }
-            cxt = cxt * 256 + self.buf[self.buf_pos-1 & BUF_END] as usize;
-        } 
-        else {
-            self.mch_len = 0;
-        }
-        // -------------
-        let pr = self.s.stretch(self.sm.p(bit, cxt as i32));
-        mxr.add(pr);
-
-        // Update index
-        if self.bits == 0 {
-            self.ht[self.hash_s] = self.buf_pos as u32;
-            self.ht[self.hash_l] = self.buf_pos as u32;
-        }
-        // -------------
-        self.mch_len
     }
-} 
+}
 // ----------------------------------------------------------------------------------------------------------------------------------------
 
 
@@ -485,7 +482,7 @@ impl HashTable {
         i = i.wrapping_mul(123456791).rotate_right(16).wrapping_mul(234567891);
         let chksum = (i >> 24) as u8;
         let mut i = i as usize; // Convert to usize for indexing
-        i = (i * B) & (self.size - B); // Restrict i to valid ht index
+        i = (i * B) & (self.size - B);
         if self.t[i]     == chksum { return &mut self.t[i];     }
         if self.t[i^B]   == chksum { return &mut self.t[i^B];   }
         if self.t[i^B*2] == chksum { return &mut self.t[i^B*2]; }
@@ -501,114 +498,135 @@ impl HashTable {
 }
 // ----------------------------------------------------------------------------------------------------------------------------------------
 
+fn next_state(state: u8, bit: i32) -> u8 {
+    STATE_TABLE[state as usize][bit as usize]
+}
 
 // Predictor -------------------------------------------------------------------------------------------------------------------- Predictor
 struct Predictor {
-    cxt:   u32,            mm:    MatchModel,    
-    cxt4:  u32,            ht:    HashTable, 
-    bits:  usize,          apm1:  Apm,            
-    pr:    i32,            apm2:  Apm,  
-    h:     [u32; 6],       sm0:   StateMap,              
-    sp:    [*mut u8; 6],   sm1:   StateMap,
-    t0:    [u8; 65_536],   sm2:   StateMap,
-    mxr:   Mixer,          sm3:   StateMap,
-    s:     Stretch,        sm4:   StateMap,
-                           sm5:   StateMap,     
+    cxt:   u32,            mm:    MatchModel,
+    cxt4:  u32,            ht:    HashTable,
+    bits:  usize,          apm1:  Apm,
+    pr:    i32,            apm2:  Apm,
+    h:     [u32; 6],       
+    sp:    [*mut u8; 6],   
+    t0:    [u8; 65_536],   
+    mxr:   Mixer,          
+    s:     Stretch,                               
+    sm:    Vec<StateMap>,
 }
 impl Predictor {
     fn new() -> Predictor {
         let mut p = Predictor {
-            cxt:   1,                   mm:    MatchModel::new(),           
-            cxt4:  0,                   ht:    HashTable::new(MEM*2),    
-            bits:  0,                   apm1:  Apm::new(256), 
-            pr:    2048,                apm2:  Apm::new(16384), 
-            h:     [0; 6],              sm0:   StateMap::new(256),
-            sp:    [&mut 0; 6],         sm1:   StateMap::new(256),
-            t0:    [0; 65_536],         sm2:   StateMap::new(256),
-            mxr:   Mixer::new(7, 80),   sm3:   StateMap::new(256),
-            s:     Stretch::new(),      sm4:   StateMap::new(256),
-                                        sm5:   StateMap::new(256),  
+            cxt:   1,                   mm:    MatchModel::new(),
+            cxt4:  0,                   ht:    HashTable::new(MEM*2),
+            bits:  0,                   apm1:  Apm::new(256),
+            pr:    2048,                apm2:  Apm::new(16384),
+            h:     [0; 6],              
+            sp:    [&mut 0; 6],         
+            t0:    [0; 65_536],         
+            mxr:   Mixer::new(7, 80),   
+            s:     Stretch::new(),                                  
+            sm:    vec![StateMap::new(256); 6],
         };
         for i in 0..6 {
             p.sp[i] = &mut p.t0[0];
         }
         p
     }
-    fn p(&mut self) -> i32 { 
+
+    fn p(&mut self) -> i32 {
         assert!(self.pr >= 0 && self.pr < 4096);
-        self.pr 
-    } 
-    fn update_sp(&mut self, cxt: [u32; 6], nibble: u32) {
-        unsafe { 
-            self.sp[1] = self.ht.hash(cxt[1]+nibble).add(1);
-            self.sp[2] = self.ht.hash(cxt[2]+nibble).add(1);
-            self.sp[3] = self.ht.hash(cxt[3]+nibble).add(1);
-            self.sp[4] = self.ht.hash(cxt[4]+nibble).add(1);
-            self.sp[5] = self.ht.hash(cxt[5]+nibble).add(1);
+        self.pr
+    }
+
+    // Set state pointer 'sp[i]' (excluding sp[0]) 
+    // to beginning of new state array
+    fn update_state_ptrs(&mut self, cxt: [u32; 6], nibble: u32) {
+        unsafe {
+            for i in 1..6 {
+                self.sp[i] = self.ht.hash(cxt[i]+nibble).add(1);
+            }
         }
     }
+
+    // Update order 1, 2, 3, 4, 6, and unigram word contexts
+    fn update_cxts(&mut self, cxt: u32, cxt4: u32) {
+        self.h[0] =  cxt << 8;                         // Order 1
+        self.h[1] = (cxt4 & 0xFFFF) << 5 | 0x57000000; // Order 2
+        self.h[2] = (cxt4 << 8).wrapping_mul(3);       // Order 3
+        self.h[3] =  cxt4.wrapping_mul(5);             // Order 4
+        self.h[4] =  self.h[4].wrapping_mul(11 << 5)   // Order 6
+                     + cxt * 13 & 0x3FFFFFFF;
+        
+        match self.cxt { // Unigram Word Order
+            65..=90 => {
+                self.cxt += 32; // Fold to lowercase
+                self.h[5] = (self.h[5] + self.cxt).wrapping_mul(7 << 3);
+            }
+            97..=122 => {
+                self.h[5] = (self.h[5] + self.cxt).wrapping_mul(7 << 3);
+            },
+            _ => self.h[5] = 0,
+        }
+    }
+
     fn update(&mut self, bit: i32) {
         assert!(bit == 0 || bit == 1);
-        unsafe { 
-        *self.sp[0] = next_state(*self.sp[0], bit);
-        *self.sp[1] = next_state(*self.sp[1], bit);
-        *self.sp[2] = next_state(*self.sp[2], bit);
-        *self.sp[3] = next_state(*self.sp[3], bit);
-        *self.sp[4] = next_state(*self.sp[4], bit);
-        *self.sp[5] = next_state(*self.sp[5], bit);
+
+        // Transition to new states
+        unsafe {
+            for i in 0..6 {
+                *self.sp[i] = next_state(*self.sp[i], bit);
+            }
         }
         self.mxr.update(bit);
 
+        // Update order-0 context
         self.cxt += self.cxt + bit as u32;
         self.bits += 1;
-        if self.cxt >= 256 {
-            self.cxt -= 256;
-            self.cxt4 = (self.cxt4 << 8) | self.cxt;  
-            self.h[0] =  self.cxt << 8;                         // Order 1
-            self.h[1] = (self.cxt4 & 0xFFFF) << 5 | 0x57000000; // Order 2
-            self.h[2] = (self.cxt4 << 8).wrapping_mul(3);       // Order 3
-            self.h[3] =  self.cxt4.wrapping_mul(5);             // Order 4
-            self.h[4] =  self.h[4].wrapping_mul(11 << 5)        // Order 6
-                         + self.cxt * 13 & 0x3FFFFFFF;
-            
-            match self.cxt { // Unigram Word Order
-                65..=90 => {
-                    self.cxt += 32; // Fold to lowercase
-                    self.h[5] = (self.h[5] + self.cxt).wrapping_mul(7 << 3);
-                }
-                97..=122 => {
-                    self.h[5] = (self.h[5] + self.cxt).wrapping_mul(7 << 3);
-                },
-                _ => self.h[5] = 0,
-            }
 
-            self.update_sp(self.h, 0);
+        if self.cxt >= 256 { // Byte boundary
+            // Update order-3 context
+            self.cxt -= 256;
+            self.cxt4 = (self.cxt4 << 8) | self.cxt;
+            self.update_cxts(self.cxt, self.cxt4);
+
+            self.update_state_ptrs(self.h, 0);
+
             self.cxt = 1;
             self.bits = 0;
         }
-        if self.bits == 4 {
-            self.update_sp(self.h, self.cxt);
+        if self.bits == 4 { // Nibble boundary
+            self.update_state_ptrs(self.h, self.cxt);
         }
         else if self.bits > 0 {
+            // Calculate new state array index
             let j = ((bit as usize) + 1) << (self.bits & 3) - 1;
-            unsafe { 
-            self.sp[1] = self.sp[1].add(j);
-            self.sp[2] = self.sp[2].add(j);
-            self.sp[3] = self.sp[3].add(j);
-            self.sp[4] = self.sp[4].add(j);
-            self.sp[5] = self.sp[5].add(j);
+            unsafe {
+                for i in 1..6 {
+                    self.sp[i] = self.sp[i].add(j);
+                }
             }
         }
+    
+        // Update order-1 context
         unsafe { 
         self.sp[0] = ((&mut self.t0[0] as *mut u8)
                      .add(self.h[0] as usize))
                      .add(self.cxt as usize);
         }
         
-        let len = self.mm.p(bit, &mut self.mxr);
+
+        // Get prediction and length from match model
+        self.mm.p(bit, &mut self.mxr);
+        let len = self.mm.len();
         let mut order: u32 = 0;
+
+        // If len is 0, order is determined from 
+        // number of non-zero bit histories
         if len == 0 {
-            unsafe { 
+            unsafe {
             if *self.sp[4] != 0 { order += 1; }
             if *self.sp[3] != 0 { order += 1; }
             if *self.sp[2] != 0 { order += 1; }
@@ -622,23 +640,30 @@ impl Predictor {
             if len >= 16 { 1 } else { 0 } +
             if len >= 32 { 1 } else { 0 };
         }
-        
-        unsafe { 
-        self.mxr.add(self.s.stretch(self.sm0.p(bit, *self.sp[0] as i32)));
-        self.mxr.add(self.s.stretch(self.sm1.p(bit, *self.sp[1] as i32)));
-        self.mxr.add(self.s.stretch(self.sm2.p(bit, *self.sp[2] as i32)));
-        self.mxr.add(self.s.stretch(self.sm3.p(bit, *self.sp[3] as i32)));
-        self.mxr.add(self.s.stretch(self.sm4.p(bit, *self.sp[4] as i32)));
-        self.mxr.add(self.s.stretch(self.sm5.p(bit, *self.sp[5] as i32)));
+
+        // Add independent predictions to mixer 
+        unsafe {
+            for i in 0..6 {
+                self.mxr.add(
+                    self.s.stretch(
+                        self.sm[i].p(bit, *self.sp[i] as i32)
+                    )
+                );
+            }
         }
+
+        // Set weights to be used during mixing
         self.mxr.set(order + 10 * (self.h[0] >> 13));
+
+        // Mix
         self.pr = self.mxr.p();
+
+        // 2 SSE stages
         self.pr = self.pr + 3 * self.apm1.p(bit, 7, self.pr, self.cxt) >> 2;
         self.pr = self.pr + 3 * self.apm2.p(bit, 7, self.pr, self.cxt ^ self.h[0] >> 2) >> 2;
     }
 }
 // ----------------------------------------------------------------------------------------------------------------------------------------
-
 
 // Encoder ------------------------------------------------------------------------------------------------------------------------ Encoder
 #[derive(PartialEq, Eq)]
@@ -664,20 +689,21 @@ impl Encoder {
             x: 0, 
             predictor: Predictor::new(), 
             file_in, file_out, mode,
-        };  
+        };   
         if enc.mode == Mode::Compress {
             enc.file_out.write_usize(0);
             enc.file_out.write_usize(0);
             enc.file_out.write_usize(0);
-        } 
+        }
         enc
     }
     fn compress_bit(&mut self, bit: i32) {
         let mut p = self.predictor.p() as u32;
-        if p < 2048 { p += 1; } 
+        if p < 2048 { p += 1; } // Causes Silesia Corpus file x-ray.tif to decompress incorrectly
 
-        let mid: u32 = self.low + ((self.high - self.low) >> 12) * p 
-                       + ((self.high - self.low & 0x0FFF) * p >> 12);
+        let range = self.high - self.low;
+        let mid: u32 = self.low + (range >> 12) * p
+                       + ((range & 0x0FFF) * p >> 12);
                        
         if bit == 1 {
             self.high = mid;
@@ -696,10 +722,11 @@ impl Encoder {
     fn decompress_bit(&mut self) -> i32 {
         let mut byte = [0u8; 1];
         let mut p = self.predictor.p() as u32;
-        if p < 2048 { p += 1; }   
+        if p < 2048 { p += 1; } // Causes Silesia Corpus file x-ray.tif to decompress incorrectly  
 
-        let mid: u32 = self.low + ((self.high - self.low) >> 12) * p 
-                       + ((self.high - self.low & 0x0FFF) * p >> 12);
+        let range = self.high - self.low;
+        let mid: u32 = self.low + (range >> 12) * p
+                       + ((range & 0x0FFF) * p >> 12);
 
         let mut bit: i32 = 0;
         if self.x <= mid {
@@ -780,13 +807,12 @@ impl Encoder {
 }
 // ----------------------------------------------------------------------------------------------------------------------------------------
 
-
 fn main() {
     let start_time = Instant::now();
     let args: Vec<String> = env::args().collect();
 
-    let e_file_in  = new_input_file(4096, &args[2]);
-    let e_file_out = new_output_file(4096, &args[3]);
+    let e_file_in  = new_input_file(4096, &args[args.len()-2]);
+    let e_file_out = new_output_file(4096, &args[args.len()-1]);
 
     match (&args[1]).as_str() {
         "c" => {  
@@ -794,7 +820,7 @@ fn main() {
             let mut final_block_size = 0;
             let mut num_blocks = 0;
 
-            let mut file_in = new_input_file(block_size, &args[2]);
+            let mut file_in = new_input_file(block_size, &args[args.len()-2]);
             let mut enc = Encoder::new(e_file_in, e_file_out, Mode::Compress);
 
             // Compress ---------------------------------------------------
@@ -810,7 +836,7 @@ fn main() {
             println!("Finished Compressing.");
         }
         "d" => {
-            let mut file_out = new_output_file(4096, &args[3]);
+            let mut file_out = new_output_file(4096, &args[args.len()-1]);
             let mut dec = Encoder::new(e_file_in, e_file_out, Mode::Decompress);
 
             let (final_block_size, block_size, num_blocks) = dec.read_block_data();
@@ -838,10 +864,8 @@ fn main() {
             println!("To Decompress: d input output");
         }
     }
-    let file_in_size  = metadata(Path::new(&args[2])).unwrap().len();
-    let file_out_size = metadata(Path::new(&args[3])).unwrap().len();   
+    let file_in_size  = metadata(Path::new(&args[args.len()-2])).unwrap().len();
+    let file_out_size = metadata(Path::new(&args[args.len()-1])).unwrap().len();   
     println!("{} bytes -> {} bytes in {:.2?}", 
     file_in_size, file_out_size, start_time.elapsed());  
 }
-
-

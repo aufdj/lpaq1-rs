@@ -542,7 +542,7 @@ impl Predictor {
 
     // Set state pointer 'sp[i]' (excluding sp[0]) 
     // to beginning of new state array
-    fn update_state_ptrs(&mut self, cxt: [u32; 6], nibble: u32) {
+    fn new_state_arr(&mut self, cxt: [u32; 6], nibble: u32) {
         unsafe {
             for i in 1..6 {
                 self.sp[i] = self.ht.hash(cxt[i]+nibble).add(1);
@@ -592,13 +592,13 @@ impl Predictor {
             self.cxt4 = (self.cxt4 << 8) | self.cxt;
             self.update_cxts(self.cxt, self.cxt4);
 
-            self.update_state_ptrs(self.h, 0);
+            self.new_state_arr(self.h, 0);
 
             self.cxt = 1;
             self.bits = 0;
         }
         if self.bits == 4 { // Nibble boundary
-            self.update_state_ptrs(self.h, self.cxt);
+            self.new_state_arr(self.h, self.cxt);
         }
         else if self.bits > 0 {
             // Calculate new state array index
